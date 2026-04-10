@@ -85,9 +85,8 @@ Table~\ref{tab:intro-perf} shows the result: in FP32 on an RTX~2080~Ti,
 \sysname's \skipgemm is faster than all existing sparse convolution
 systems \emph{across the entire active-ratio spectrum}.
 At 1\% active ratio (typical for early layers of LiDAR detection networks),
-\skipgemm is $\mathbf{20\times}$ faster than TorchSparse++ and
-$\mathbf{12\times}$ faster than SpConv~v2.
-Even at 30\% active ratio, \skipgemm maintains a $\mathbf{2\times}$ advantage.
+\skipgemm is $\mathbf{11.5\times}$ faster than the best baseline (SpConv~v2).
+Even at 30\% active ratio, \skipgemm maintains a $\mathbf{1.9\times}$ advantage.
 
 This advantage reflects a fundamental difference in execution model.
 Implicit GEMM is output-stationary: each thread block owns a fixed set of
@@ -163,7 +162,7 @@ convolution layers.
 \item \textbf{\skipgemm}, a weight-stationary execution model for sparse
 convolution that achieves computation proportional to active neighbor pairs
 within a single persistent-thread kernel. At 1\% active ratio, this is
-$20\times$ faster than TorchSparse++ in FP32.
+$11.5\times$ faster than the best existing system in FP32.
 
 \item \textbf{\elasticgemm}, an adaptive output-stationary kernel that
 dynamically redistributes compute based on per-offset sparsity within each
