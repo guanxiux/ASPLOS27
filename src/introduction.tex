@@ -47,22 +47,22 @@ $1.2$--$2.9\times$ remains.
 \caption{Kernel latency (ms) for SubM $3{\times}3{\times}3$ convolution,
 $C_\text{in}{=}C_\text{out}{=}128$, spatial $128{\times}256{\times}16$,
 FP32, RTX~2080~Ti. \sysname's \skipgemm is faster than all
-existing systems across the entire active-ratio spectrum, from
-$14\times$ at 0.1\% to $2\times$ at 30\%.}
+existing systems across the entire active-ratio spectrum.
+Speedup is relative to the fastest baseline at each ratio.}
 \label{tab:intro-perf}
 \small
 \begin{tabular}{@{}r rrrr@{}}
 \toprule
-Active & \sysname & SpConv & TorchSparse++ & \skipgemm \\
+Active & \sysname & SpConv & TorchSparse++ & \\
 ratio  & \skipgemm & v2 &  & speedup \\
 \midrule
-0.1\% & \textbf{0.044} & 0.385 & 0.613 & $14\times$ \\
-0.5\% & \textbf{0.058} & 0.555 & 0.776 & $13\times$ \\
-1\%   & \textbf{0.056} & 0.645 & 1.116 & $20\times$ \\
-5\%   & \textbf{0.300} & 1.165 & 2.662 & $9\times$ \\
-10\%  & \textbf{0.961} & 2.863 & 5.226 & $5\times$ \\
-20\%  & \textbf{4.218} & 8.792 & 10.459 & $2.5\times$ \\
-30\%  & \textbf{8.094} & 15.442 & 16.013 & $2\times$ \\
+0.1\% & \textbf{0.044} & 0.385 & 0.613 & $8.8\times$ \\
+0.5\% & \textbf{0.058} & 0.555 & 0.776 & $9.6\times$ \\
+1\%   & \textbf{0.056} & 0.645 & 1.116 & $11.5\times$ \\
+5\%   & \textbf{0.300} & 1.165 & 2.662 & $3.9\times$ \\
+10\%  & \textbf{0.961} & 2.863 & 5.226 & $3.0\times$ \\
+20\%  & \textbf{4.218} & 8.792 & 10.459 & $2.1\times$ \\
+30\%  & \textbf{8.094} & 15.442 & 16.013 & $1.9\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
