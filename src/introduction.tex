@@ -1,0 +1,184 @@
+\section{Introduction}
+\label{sec:intro}
+
+Sparse convolution is the computational backbone of 3D point cloud perception.
+Applications ranging from LiDAR-based autonomous driving~\cite{centerpoint,second}
+to 3D semantic segmentation~\cite{semantickitti} and scene
+reconstruction rely on sparse convolution to process the inherently sparse
+voxelized representations of 3D sensor data.
+Unlike dense 2D convolution, where every spatial location participates in
+computation, 3D point clouds exhibit extreme sparsity: typical LiDAR scans
+occupy fewer than 5\% of the voxel grid, and early network layers may see
+active ratios below 0.5\%.
+
+This sparsity creates a fundamental tension in GPU kernel design.
+On one hand, \emph{skipping empty neighbors} avoids wasted computation---a
+voxel with only 3 active neighbors out of 27 in a $3{\times}3{\times}3$ kernel
+should ideally perform $9\times$ less work than a dense convolution.
+On the other hand, GPU efficiency demands \emph{regular, coalesced memory
+access and high arithmetic intensity}---properties that are difficult to
+maintain when the computation pattern is irregular and data-dependent.
+
+Existing sparse convolution libraries resolve this tension by committing to
+one side.
+The \emph{gather-GEMM-scatter} approach (MinkowskiEngine~\cite{minkowski})
+iterates over kernel offsets, gathers active input features into a dense
+buffer, performs a standard GEMM, and scatters results back.
+This achieves perfect computation skipping---only active neighbor pairs are
+computed---but pays a heavy price: up to 27 separate kernel launches per
+layer, severe load imbalance across offsets, and redundant memory traffic
+from explicit gather/scatter buffers.
+The \emph{implicit GEMM} approach (SpConv~v2~\cite{spconv2},
+TorchSparse++~\cite{torchsparse++}) fuses all offsets into a single
+output-stationary GEMM kernel, achieving high GPU utilization and Tensor Core
+compatibility.
+However, implicit GEMM tiles the full $K = K_\text{vol} \times C_\text{in}$
+dimension, including offsets where a given output point has no active neighbor.
+These empty slots produce zero-valued input features that still consume
+memory bandwidth and MAC cycles.
+TorchSparse++ mitigates this through bitmask sorting---grouping output points
+with similar active-neighbor patterns so that entire K-tiles can be skipped
+when no point in a warp has an active neighbor at that offset---but the skip
+granularity is coarse (warp $\times$ K-tile), and residual redundancy of
+$1.2$--$2.9\times$ remains.
+
+\begin{table}[t]
+\centering
+\caption{Kernel latency (ms) for SubM $3{\times}3{\times}3$ convolution,
+$C_\text{in}{=}C_\text{out}{=}128$, spatial $128{\times}256{\times}16$,
+FP32, RTX~2080~Ti. \sysname's expanded worklist (EW) is faster than all
+existing systems across the entire active-ratio spectrum, from
+$14\times$ at 0.1\% to $2\times$ at 30\%.}
+\label{tab:intro-perf}
+\small
+\begin{tabular}{@{}r rrrr@{}}
+\toprule
+Active & \sysname & SpConv & TorchSparse++ & EW \\
+ratio  & EW & v2 &  & speedup \\
+\midrule
+0.1\% & \textbf{0.044} & 0.385 & 0.613 & $14\times$ \\
+0.5\% & \textbf{0.058} & 0.555 & 0.776 & $13\times$ \\
+1\%   & \textbf{0.056} & 0.645 & 1.116 & $20\times$ \\
+5\%   & \textbf{0.300} & 1.165 & 2.662 & $9\times$ \\
+10\%  & \textbf{0.961} & 2.863 & 5.226 & $5\times$ \\
+20\%  & \textbf{4.218} & 8.792 & 10.459 & $2.5\times$ \\
+30\%  & \textbf{8.094} & 15.442 & 16.013 & $2\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We present \sysname, a sparse convolution runtime that bridges this gap
+through a new execution model: the \emph{expanded worklist}.
+Rather than iterating over offsets (gather-GEMM-scatter) or tiling the full
+$K_\text{vol} \times C_\text{in}$ dimension (implicit GEMM), the expanded
+worklist \emph{precomputes all active (input, output) neighbor pairs},
+groups them by kernel offset, and executes them as per-offset dense GEMM
+tiles within a single persistent-thread kernel.
+Empty offsets produce zero pairs and are skipped entirely---no wasted
+computation, no redundant memory access.
+Unlike gather-GEMM-scatter, all offsets are fused into one kernel launch
+with automatic load balancing via the persistent-thread stride loop.
+
+Table~\ref{tab:intro-perf} shows the result: in FP32 on an RTX~2080~Ti,
+\sysname's expanded worklist is faster than all existing sparse convolution
+systems \emph{across the entire active-ratio spectrum}.
+At 1\% active ratio (typical for early layers of LiDAR detection networks),
+EW is $\mathbf{20\times}$ faster than TorchSparse++ and $\mathbf{12\times}$
+faster than SpConv~v2.
+Even at 30\% active ratio, EW maintains a $\mathbf{2\times}$ advantage.
+
+The expanded worklist's advantage reflects a fundamental difference in
+\emph{execution model}.
+Implicit GEMM is output-stationary: each thread block owns a fixed set of
+output points and iterates over all kernel offsets, including empty ones.
+The expanded worklist is weight-stationary: each tile owns a fixed kernel
+offset and iterates over only the active pairs for that offset.
+At high sparsity, the weight-stationary model processes work proportional to
+the number of active neighbor pairs ($\sum_\delta |\mathcal{M}_\delta|$),
+while the output-stationary model processes work proportional to the full
+kernel volume ($N_\text{out} \times K_\text{vol} \times C_\text{in}$).
+At 1\% active ratio, the expanded worklist performs roughly $100\times$ less
+useful work---this is not an implementation gap but a model gap.
+
+At high sparsity, the expanded worklist is near-optimal: every MAC is useful,
+load balancing is automatic via the persistent-thread stride loop, and the
+only overhead is the worklist construction itself (a single GPU kernel,
+amortizable across layers for submanifold convolution where the active set
+is preserved).
+However, as the active ratio rises, a structural bottleneck emerges.
+Because the expanded worklist is weight-stationary, different offset tiles
+write partial results to the same output rows via \texttt{atomicAdd}.
+At 30\% active ratio, each output point receives contributions from
+${\sim}8$ offsets on average, and the atomic writeback traffic grows
+proportionally.
+While EW still wins in FP32 (Table~\ref{tab:intro-perf}), the margin
+narrows---and under Tensor Core precision (FP16/TF32), where
+TorchSparse++'s implicit GEMM gains a hardware compute advantage, the
+crossover shifts to ${\sim}20$--$25\%$.
+In real detection networks such as CenterPoint~\cite{centerpoint}, the
+deepest sparse convolution stage (after $3\times$ stride-2 downsampling)
+operates at 35--57\% active ratio with $C_\text{in}{=}64$--$128$---precisely
+the regime where EW's writeback overhead is most acute.
+
+To close this gap, we propose \emph{elastic implicit GEMM}, an adaptive
+output-stationary kernel that eliminates the redundant computation of
+standard implicit GEMM without introducing atomic scatter.
+The key observation is that within an output-stationary thread block
+processing a $3{\times}3{\times}3$ kernel, the number of active neighbors
+varies dramatically per offset: some offsets (e.g., the center) are active
+for nearly all output points, while peripheral offsets may be active for
+only a fraction.
+In standard implicit GEMM, threads assigned to inactive output points at a
+given offset compute zero-valued MACs---wasted cycles that cannot be
+reclaimed.
+Elastic implicit GEMM \emph{redistributes} these idle threads: when only
+$1/k$ of the output points in a tile have active neighbors at a given
+offset, all threads cooperatively process different input channel segments
+of the active points, reducing the K-loop iteration count for that offset
+by a factor of $k$.
+After the shortened K-loop, a lightweight shared-memory reduce combines the
+partial channel sums---trading one reduce (a shared-memory write + read +
+barrier) for $k{-}1$ eliminated K-tile iterations (each involving global
+loads + full GEMM compute).
+This trade is overwhelmingly favorable: at $C_\text{in}{=}64$ and
+$\text{BK}{=}8$, a $4\times$ elastic reduction saves 6 K-tile iterations
+and costs one shared-memory round-trip.
+
+Together, the expanded worklist and elastic implicit GEMM form a unified
+runtime that covers the full sparsity spectrum:
+EW handles the high-sparsity layers where per-pair skip dominates
+(0.1--10\% active ratio), while elastic implicit GEMM handles the
+low-sparsity layers where output-stationary execution with adaptive compute
+redistribution is more efficient (20--50\%+).
+The dispatch decision is made once per layer based on the active ratio,
+which is known after voxelization (and preserved across submanifold
+convolution layers).
+The key insight is that within an output-stationary thread block, the number
+of active neighbors varies per offset: some offsets are active for most
+output points in the tile, while others are active for only a few.
+For sparsely-active offsets, most threads would compute zero-valued MACs.
+Instead, elastic implicit GEMM \emph{redistributes} these idle threads to
+cooperatively process different input channel segments of the few active
+points, reducing the number of K-loop iterations for that offset.
+After the shortened K-loop, a lightweight shared-memory reduce combines the
+partial sums.
+This trades one reduce operation (a shared-memory write + read + sync) for
+multiple eliminated K-tile iterations (each involving global memory loads +
+full GEMM compute), a highly favorable exchange.
+
+The contributions of this paper are:
+\begin{enumerate}
+\item The \textbf{expanded worklist execution model} for sparse convolution,
+achieving computation proportional to active neighbor pairs within a single
+persistent-thread kernel. At 1\% active ratio, this is $20\times$ faster
+than TorchSparse++ in FP32.
+
+\item \textbf{Elastic implicit GEMM}, an adaptive output-stationary kernel
+that dynamically redistributes compute based on per-offset sparsity within
+each thread block, eliminating redundant computation without atomic scatter.
+
+\item A \textbf{unified runtime} that selects between expanded worklist
+(low active ratio) and elastic implicit GEMM (high active ratio) per layer,
+targeting end-to-end speedup across the full sparsity spectrum of real 3D
+perception models.
+\end{enumerate}

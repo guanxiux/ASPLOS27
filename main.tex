@@ -1,0 +1,58 @@
+% ASPLOS submission — acmart sigplan, anonymous, 10pt
+\documentclass[sigplan,anonymous,review,10pt]{acmart}
+
+% Disable ACM-specific metadata for submission
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+\usepackage{booktabs}
+\usepackage{subcaption}
+\usepackage{xspace}
+
+\newcommand{\sysname}{ActiMM\xspace}
+\newcommand{\ew}{expanded worklist\xspace}
+
+\begin{document}
+
+\title{Elastic Sparse Convolution: Adaptive Compute Redistribution for 3D Point Cloud Processing}
+
+\author{Anonymous}
+\affiliation{\institution{Anonymous}}
+
+\begin{abstract}
+Sparse convolution is the dominant primitive for 3D point cloud perception,
+yet existing GPU implementations face a fundamental tradeoff between
+\emph{computation skipping} and \emph{kernel efficiency}.
+Gather-GEMM-scatter approaches (e.g., MinkowskiEngine) skip empty neighbors
+entirely but suffer from per-offset kernel launch overhead and load imbalance.
+Implicit GEMM approaches (e.g., SpConv~v2, TorchSparse++) fuse all offsets
+into a single efficient kernel but cannot skip empty neighbors, incurring
+redundant computation proportional to sparsity.
+
+We present \sysname, a sparse convolution runtime that eliminates this tradeoff
+through two complementary execution models.
+First, the \emph{expanded worklist} (EW) decomposes sparse convolution into
+per-offset dense GEMM tiles containing only active neighbor pairs, achieving
+computation strictly proportional to active pairs within a single persistent-thread
+kernel.
+Second, \emph{elastic implicit GEMM} dynamically redistributes compute within
+each thread block based on per-offset sparsity: when few output points have
+active neighbors at a given offset, idle threads cooperatively process
+different channel segments of the active points, trading a lightweight
+register reduce for multiple eliminated K-loop iterations.
+
+On an RTX~2080~Ti with FP32 precision, \sysname's expanded worklist is
+faster than all existing sparse convolution systems across the entire
+active-ratio spectrum: $20\times$ faster than TorchSparse++ at 1\% active
+ratio, and still $2\times$ faster at 30\%.
+\end{abstract}
+
+\maketitle
+
+\input{src/introduction}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{refs}
+
+\end{document}
