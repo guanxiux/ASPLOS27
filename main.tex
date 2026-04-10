@@ -11,11 +11,12 @@
 \usepackage{xspace}
 
 \newcommand{\sysname}{ActiMM\xspace}
-\newcommand{\ew}{expanded worklist\xspace}
+\newcommand{\skipgemm}{Skip GEMM\xspace}
+\newcommand{\elasticgemm}{Elastic GEMM\xspace}
 
 \begin{document}
 
-\title{Elastic Sparse Convolution: Adaptive Compute Redistribution for 3D Point Cloud Processing}
+\title{\sysname: Bridging Skip and Efficiency in GPU Sparse Convolution for 3D Point Cloud Processing}
 
 \author{Anonymous}
 \affiliation{\institution{Anonymous}}
@@ -30,19 +31,17 @@ Implicit GEMM approaches (e.g., SpConv~v2, TorchSparse++) fuse all offsets
 into a single efficient kernel but cannot skip empty neighbors, incurring
 redundant computation proportional to sparsity.
 
-We present \sysname, a sparse convolution runtime that eliminates this tradeoff
-through two complementary execution models.
-First, the \emph{expanded worklist} (EW) decomposes sparse convolution into
-per-offset dense GEMM tiles containing only active neighbor pairs, achieving
-computation strictly proportional to active pairs within a single persistent-thread
-kernel.
-Second, \emph{elastic implicit GEMM} dynamically redistributes compute within
-each thread block based on per-offset sparsity: when few output points have
-active neighbors at a given offset, idle threads cooperatively process
-different channel segments of the active points, trading a lightweight
-register reduce for multiple eliminated K-loop iterations.
+We present \sysname, a sparse convolution runtime that eliminates this
+tradeoff through two complementary execution models.
+\emph{\skipgemm} precomputes all active neighbor pairs and executes them as
+per-offset dense GEMM tiles within a single persistent-thread kernel,
+achieving computation strictly proportional to active pairs.
+\emph{\elasticgemm} dynamically redistributes idle threads within each
+output-stationary thread block to cooperatively process different channel
+segments of active points, trading a lightweight reduce for multiple
+eliminated K-loop iterations.
 
-On an RTX~2080~Ti with FP32 precision, \sysname's expanded worklist is
+On an RTX~2080~Ti with FP32 precision, \sysname's \skipgemm is
 faster than all existing sparse convolution systems across the entire
 active-ratio spectrum: $20\times$ faster than TorchSparse++ at 1\% active
 ratio, and still $2\times$ faster at 30\%.
