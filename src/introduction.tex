@@ -127,17 +127,17 @@ than a heavy scheduling framework:
 \end{itemize}
 %
 
-% P7 — Operator-level preview; end-to-end evaluation is in progress
-Table~\ref{tab:intro-perf} previews the operator-level impact of this
-execution model on a controlled microbenchmark.
-On an RTX~2080~Ti with FP32 precision, \sysname outperforms all existing
-sparse convolution systems across the entire active-ratio range tested.
-At 1\% active ratio (typical for LiDAR detection layers), \sysname is
-$5.5\times$ faster than the fastest existing system.
-The advantage holds up to 30\%, where \sysname still maintains a
-$1.8\times$ margin.
-End-to-end model-level evaluation on detection and segmentation benchmarks
-is presented in \S\ref{sec:eval}.
+% % P7 — Operator-level preview; end-to-end evaluation is in progress
+% Table~\ref{tab:intro-perf} previews the operator-level impact of this
+% execution model on a controlled microbenchmark.
+% On an RTX~2080~Ti with FP32 precision, \sysname outperforms all existing
+% sparse convolution systems across the entire active-ratio range tested.
+% At 1\% active ratio (typical for LiDAR detection layers), \sysname is
+% $5.5\times$ faster than the fastest existing system.
+% The advantage holds up to 30\%, where \sysname still maintains a
+% $1.8\times$ margin.
+% End-to-end model-level evaluation on detection and segmentation benchmarks
+% is presented in \S\ref{sec:eval}.
 
 \begin{table}[t]
 \centering
