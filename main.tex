@@ -8,11 +8,10 @@
 
 \usepackage{booktabs}
 \usepackage{subcaption}
+\usepackage{multirow}
 \usepackage{xspace}
 
 \newcommand{\sysname}{ActiMM\xspace}
-\newcommand{\skipgemm}{Skip GEMM\xspace}
-\newcommand{\elasticgemm}{Elastic GEMM\xspace}
 
 \begin{document}
 
@@ -22,29 +21,30 @@
 \affiliation{\institution{Anonymous}}
 
 \begin{abstract}
-Sparse convolution is the dominant primitive for 3D point cloud perception,
-yet existing GPU implementations face a fundamental tradeoff between
-\emph{computation skipping} and \emph{kernel efficiency}.
-Gather-GEMM-scatter approaches (e.g., MinkowskiEngine) skip empty neighbors
-entirely but suffer from per-offset kernel launch overhead and load imbalance.
-Implicit GEMM approaches (e.g., SpConv~v2, TorchSparse++) fuse all offsets
-into a single efficient kernel but cannot skip empty neighbors, incurring
-redundant computation proportional to sparsity.
+Sparse convolution is the dominant primitive for 3D point-cloud perception,
+yet existing GPU runtimes face a fundamental tradeoff between
+\emph{computation skipping} and \emph{execution efficiency}.
+Gather-GEMM-scatter approaches skip empty neighbors but suffer from
+per-offset launch overhead and load imbalance.
+Implicit GEMM approaches fuse all offsets into one efficient kernel but
+cannot skip empty neighbors, wasting compute proportional to sparsity.
 
-We present \sysname, a sparse convolution runtime that eliminates this
-tradeoff through two complementary execution models.
-\emph{\skipgemm} precomputes all active neighbor pairs and executes them as
-per-offset dense GEMM tiles within a single persistent-thread kernel,
-achieving computation strictly proportional to active pairs.
-\emph{\elasticgemm} dynamically redistributes idle threads within each
-output-stationary thread block to cooperatively process different channel
-segments of active points, trading a lightweight reduce for multiple
-eliminated K-loop iterations.
+We present \sysname, a sparse convolution runtime built on
+\emph{worklist-driven execution}.
+\sysname precomputes all active neighbor pairs, groups them by kernel
+offset, and flattens the result into a contiguous tile stream executed by a
+single persistent-thread kernel.
+Empty offsets are skipped entirely; the stride loop provides automatic
+global load balance; and each tile is a pure dense GEMM.
+To recover data locality without heavy scheduling, \sysname applies
+offset-major contiguous tile assignment and autotuned weight-stationary
+micro-kernels.
 
-On an RTX~2080~Ti with FP32 precision, \sysname's \skipgemm is
-faster than all existing sparse convolution systems across the entire
-active-ratio spectrum: $11.5\times$ faster than the best baseline at 1\%
-active ratio, and still $1.9\times$ faster at 30\%.
+We evaluate \sysname end-to-end on 3D object detection and semantic
+segmentation models across real-world point-cloud datasets.
+\sysname achieves \textbf{TODO}$\times$ end-to-end speedup over
+TorchSparse++ on \textbf{TODO} and \textbf{TODO}$\times$ over SpConv~v2
+on \textbf{TODO}, while producing bit-identical results under FP32.
 \end{abstract}
 
 \maketitle

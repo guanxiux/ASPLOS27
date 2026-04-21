@@ -1,174 +1,185 @@
 \section{Introduction}
 \label{sec:intro}
 
-Sparse convolution is the computational backbone of 3D point cloud perception.
-Applications ranging from LiDAR-based autonomous driving~\cite{centerpoint,second}
-to 3D semantic segmentation~\cite{semantickitti} and scene
-reconstruction rely on sparse convolution to process the inherently sparse
-voxelized representations of 3D sensor data.
-Unlike dense 2D convolution, where every spatial location participates in
-computation, 3D point clouds exhibit extreme sparsity: typical LiDAR scans
-occupy fewer than 5\% of the voxel grid, and early network layers may see
-active ratios below 0.5\%.
+% P1 — Scene: application-level framing
+Sparse convolution is the computational backbone of 3D point-cloud
+perception.
+LiDAR-based object detection~\cite{centerpoint,second}, semantic
+segmentation~\cite{semantickitti}, and scene reconstruction all build on
+stacks of sparse convolution layers to process inherently sparse voxelized
+representations of 3D sensor data.
+In production models such as CenterPoint~\cite{centerpoint} and SECOND~\cite{second}, sparse convolution
+accounts for \textbf{TODO}\% of end-to-end inference time, making its
+runtime efficiency a first-order concern.
+These models operate at extreme sparsity: across a typical detection
+network on KITTI, the average per-layer active ratio is below
+\textbf{TODO}\%, and even the densest layers
+rarely exceed \textbf{TODO}\%.
 
-This sparsity creates a fundamental tension in GPU kernel design.
-On one hand, \emph{skipping empty neighbors} avoids wasted computation---a
-voxel with only 3 active neighbors out of 27 in a $3{\times}3{\times}3$ kernel
-should ideally perform $9\times$ less work than a dense convolution.
-On the other hand, GPU efficiency demands \emph{regular, coalesced memory
-access and high arithmetic intensity}---properties that are difficult to
-maintain when the computation pattern is irregular and data-dependent.
+% P2 — What sparse convolution computes and why it is hard on GPUs
+A sparse convolution with kernel size $k$ (typically 3; we use symmetric
+$k^3$ kernels throughout) examines $k^3$ neighbor offsets around each
+active output voxel.
+At each offset, the runtime checks whether the corresponding input
+neighbor is also active; if so, the input features at that neighbor are
+multiplied against the offset's weight slice and accumulated into the
+output.
+The set of active neighbors varies per voxel and per offset, producing an
+irregular, data-dependent computation pattern.
+The central runtime challenge is how to reorganize this irregular work into
+the regular, coalesced execution that GPUs require for high utilization.
 
-Existing sparse convolution libraries resolve this tension by committing to
-one side.
-The \emph{gather-GEMM-scatter} approach (MinkowskiEngine~\cite{minkowski})
-iterates over kernel offsets, gathers active input features into a dense
-buffer, performs a standard GEMM, and scatters results back.
-This achieves perfect computation skipping---only active neighbor pairs are
-computed---but pays a heavy price: up to 27 separate kernel launches per
-layer, severe load imbalance across offsets, and redundant memory traffic
-from explicit gather/scatter buffers.
+% P3 — Fundamental tradeoff: skip vs efficiency
+Existing systems resolve this challenge by committing to one side of a
+fundamental tradeoff between \emph{computation skipping} and
+\emph{execution efficiency}.
+
 The \emph{implicit GEMM} approach (SpConv~v2~\cite{spconv2},
-TorchSparse++~\cite{torchsparse++}) fuses all offsets into a single
-output-stationary GEMM kernel, achieving high GPU utilization and Tensor Core
-compatibility.
-However, implicit GEMM tiles the full $K = K_\text{vol} \times C_\text{in}$
-dimension, including offsets where a given output point has no active neighbor.
-These empty slots produce zero-valued input features that still consume
-memory bandwidth and MAC cycles.
-TorchSparse++ mitigates this through bitmask sorting---grouping output points
-with similar active-neighbor patterns so that entire K-tiles can be skipped
-when no point in a warp has an active neighbor at that offset---but the skip
-granularity is coarse (warp $\times$ K-tile), and residual redundancy of
-$1.2$--$2.9\times$ remains.
+TorchSparse++~\cite{torchsparse++}) treats every active output voxel as
+if all $k^3$ neighbors were present: it concatenates the full neighborhood
+into one large matrix and performs a single fused dense matrix multiply
+across all offsets simultaneously.
+This yields high GPU utilization and Tensor Core compatibility, but it
+cannot skip empty neighbors; missing neighbors simply contribute
+zero-valued rows that still consume compute cycles and memory bandwidth.
+Profiling a CenterPoint backbone on KITTI reveals that
+\textbf{TODO}\% of the fused multiply-accumulate operations
+involve such zero-valued inputs, wasted compute that
+scales with the kernel volume rather than the actual connectivity.
+
+The \emph{per-offset gather-GEMM-scatter} approach
+(MinkowskiEngine~\cite{minkowski}) takes the opposite route: it loops
+over the $k^3$ offsets one by one, collects only the active pairs at each
+offset, and runs a separate matrix multiply for each.
+This avoids wasted computation on empty neighbors.
+However, it pays a steep price: up to $k^3$ separate kernel launches per
+convolution layer, severe load imbalance across offsets, and either a
+naive in-kernel matrix multiply or an extra copy into contiguous buffers
+before handing off to a tuned dense GEMM library.
+On the same CenterPoint backbone, gather-GEMM-scatter spends
+\textbf{TODO}\% of its wall time on launch overhead and data movement
+rather than useful arithmetic.
+
+At the low densities that dominate real workloads, neither side works well.
+Implicit GEMM wastes overwhelmingly on empty neighbors.
+Gather-GEMM-scatter skips the empties, but each per-offset matrix multiply
+is too small to saturate the GPU.
+
+% P4 — Our insight: worklist-driven execution
+We observe that both sides of this tradeoff organize execution around
+\emph{offsets}: implicit GEMM iterates all offsets per output point,
+while gather-GEMM-scatter launches one kernel per offset.
+Neither organizes execution around the \emph{actual active work}.
+
+\sysname takes a different approach: \emph{worklist-driven execution}.
+We precompute all active \texttt{(input, output)} neighbor pairs across
+every offset, group them by offset, and flatten the groups into a
+contiguous stream of dense GEMM tiles (a worklist).
+A single persistent-thread kernel then stride-loops over this worklist.
+This design has three key properties:
+%
+\begin{itemize}
+  \item \textbf{Exact work.}
+        Offsets with no active pairs produce zero tiles and are skipped
+        entirely; computation is strictly proportional to active neighbor
+        pairs.
+  \item \textbf{Global load balance.}
+        All offsets share one kernel launch; the stride loop spreads tiles
+        evenly across thread blocks regardless of how unevenly pairs
+        distribute across offsets.
+  \item \textbf{Dense inner compute.}
+        Each tile is a standard dense matrix multiply, fully GPU-friendly
+        and Tensor Core compatible.
+\end{itemize}
+
+% P5 — Challenge: exact work exposes memory issues
+Exact-work execution is not free.
+Once convolution is decomposed into per-offset active pairs, the runtime
+becomes more fetch-on-demand: input features are gathered indirectly via
+pair indices, output accumulation spans multiple offsets (requiring atomic
+additions), and tile ordering strongly affects cache reuse.
+The challenge is how to recover enough data locality \emph{without}
+sacrificing exact work or breaking global load balance.
+
+% P6 — Lightweight locality recovery
+\sysname addresses this with three low-complexity dataflow choices, rather
+than a heavy scheduling framework:
+%
+\begin{itemize}
+  \item \textbf{Offset-major contiguous tile assignment.}
+        Tiles in the worklist are ordered so that consecutive iterations of
+        the stride loop tend to share the same kernel offset.
+        This improves L2 cache locality for input features while preserving
+        the load-balance property of the global stride loop.
+  \item \textbf{Weight-fragment persistence.}
+        When consecutive tiles share the same offset, the weight slice can
+        be kept live in registers instead of being reloaded.
+        This turns the offset-major ordering into a direct reduction in
+        memory traffic.
+  \item We use \textbf{two-level sparsity-aware autotuning} to find the
+        optimal tile shape and micro-kernel variant with zero overhead on
+        the critical path as runtime sparsity level varies.
+        Offline sweeps build both a per-layer config table indexed by
+        sparsity bucket and an input-to-layer sparsity mapping; at
+        inference time, the runtime reads the input active ratio and
+        selects the best config for every layer on the host alone,  
+        without any per-layer profiling or device-to-host synchronization.
+\end{itemize}
+%
+
+% P7 — Operator-level preview; end-to-end evaluation is in progress
+Table~\ref{tab:intro-perf} previews the operator-level impact of this
+execution model on a controlled microbenchmark.
+On an RTX~2080~Ti with FP32 precision, \sysname outperforms all existing
+sparse convolution systems across the entire active-ratio range tested.
+At 1\% active ratio (typical for LiDAR detection layers), \sysname is
+$5.5\times$ faster than the fastest existing system.
+The advantage holds up to 30\%, where \sysname still maintains a
+$1.8\times$ margin.
+End-to-end model-level evaluation on detection and segmentation benchmarks
+is presented in \S\ref{sec:eval}.
 
 \begin{table}[t]
 \centering
-\caption{Kernel latency (ms) for SubM $3{\times}3{\times}3$ convolution,
-$C_\text{in}{=}C_\text{out}{=}128$, spatial $128{\times}256{\times}16$,
-FP32, RTX~2080~Ti. \sysname's \skipgemm is faster than all
-existing systems across the entire active-ratio spectrum.
-Speedup is relative to the fastest baseline at each ratio.}
+\caption{Operator-level kernel latency (ms) for SubM $3{\times}3{\times}3$
+convolution, $C_\text{in}{=}C_\text{out}{=}64$, spatial
+$128{\times}128{\times}8$, FP32, RTX~2080~Ti.
+Speedup is over the fastest existing system at each ratio.
+End-to-end model evaluation with real datasets is in
+\S\ref{sec:eval} (\emph{in progress}).}
 \label{tab:intro-perf}
 \small
-\begin{tabular}{@{}r rrrr@{}}
+\begin{tabular}{@{}r rrrr r@{}}
 \toprule
-Active & \sysname & SpConv & TorchSparse++ & \\
-ratio  & \skipgemm & v2 &  & speedup \\
+Active & \multirow{2}{*}{\sysname} & SpConv & TorchSparse++ & Minkowski- & \multirow{2}{*}{Speedup} \\
+ratio  &          & v2     &               & Engine     &  \\
 \midrule
-0.1\% & \textbf{0.044} & 0.385 & 0.613 & $8.8\times$ \\
-0.5\% & \textbf{0.058} & 0.555 & 0.776 & $9.6\times$ \\
-1\%   & \textbf{0.056} & 0.645 & 1.116 & $11.5\times$ \\
-5\%   & \textbf{0.300} & 1.165 & 2.662 & $3.9\times$ \\
-10\%  & \textbf{0.961} & 2.863 & 5.226 & $3.0\times$ \\
-20\%  & \textbf{4.218} & 8.792 & 10.459 & $2.1\times$ \\
-30\%  & \textbf{8.094} & 15.442 & 16.013 & $1.9\times$ \\
+0.1\% & \textbf{0.012} & 0.421 & 0.240 & 0.230 & $19.2\times$ \\
+0.5\% & \textbf{0.045} & 0.374 & 0.240 & 0.323 & $5.3\times$ \\
+1\%   & \textbf{0.045} & 0.403 & 0.246 & 0.379 & $5.5\times$ \\
+5\%   & \textbf{0.026} & 0.436 & 0.242 & 0.386 & $9.3\times$ \\
+10\%  & \textbf{0.067} & 0.551 & 0.377 & 0.445 & $5.6\times$ \\
+20\%  & \textbf{0.240} & 1.251 & 0.685 & 0.908 & $2.9\times$ \\
+30\%  & \textbf{0.531} & 1.544 & 0.945 & 1.703 & $1.8\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-We present \sysname, a sparse convolution runtime that bridges this gap
-through two complementary execution models.
-
-\paragraph{Skip GEMM: near-optimal at high sparsity.}
-Rather than iterating over offsets (gather-GEMM-scatter) or tiling the full
-$K_\text{vol} \times C_\text{in}$ dimension (implicit GEMM), \skipgemm
-\emph{precomputes all active (input, output) neighbor pairs},
-groups them by kernel offset, and executes them as per-offset dense GEMM
-tiles within a single persistent-thread kernel.
-Empty offsets produce zero pairs and are skipped entirely---no wasted
-computation, no redundant memory access.
-Unlike gather-GEMM-scatter, all offsets are fused into one kernel launch
-with automatic load balancing via the persistent-thread stride loop.
-
-Table~\ref{tab:intro-perf} shows the result: in FP32 on an RTX~2080~Ti,
-\sysname's \skipgemm is faster than all existing sparse convolution
-systems \emph{across the entire active-ratio spectrum}.
-At 1\% active ratio (typical for early layers of LiDAR detection networks),
-\skipgemm is $\mathbf{11.5\times}$ faster than the best baseline (SpConv~v2).
-Even at 30\% active ratio, \skipgemm maintains a $\mathbf{1.9\times}$ advantage.
-
-This advantage reflects a fundamental difference in execution model.
-Implicit GEMM is output-stationary: each thread block owns a fixed set of
-output points and iterates over all kernel offsets, including empty ones.
-\skipgemm is weight-stationary: each tile owns a fixed kernel
-offset and iterates over only the active pairs for that offset.
-At high sparsity, the weight-stationary model processes work proportional to
-the number of active neighbor pairs ($\sum_\delta |\mathcal{M}_\delta|$),
-while the output-stationary model processes work proportional to the full
-kernel volume ($N_\text{out} \times K_\text{vol} \times C_\text{in}$).
-At 1\% active ratio, \skipgemm performs roughly $100\times$ less
-useful work---this is not an implementation gap but a model gap.
-
-At high sparsity, \skipgemm is near-optimal: every MAC is useful,
-load balancing is automatic, and the only overhead is the worklist
-construction itself (a single GPU kernel, amortizable across submanifold
-convolution layers where the active set is preserved).
-
-\paragraph{Elastic GEMM: closing the gap at moderate sparsity.}
-As the active ratio rises, a structural bottleneck emerges in \skipgemm.
-Because it is weight-stationary, different offset tiles write partial results
-to the same output rows via \texttt{atomicAdd}.
-At 30\% active ratio, each output point receives contributions from
-${\sim}8$ offsets on average, and the atomic writeback traffic grows
-proportionally.
-While \skipgemm still wins in FP32 (Table~\ref{tab:intro-perf}), the margin
-narrows---and under Tensor Core precision (FP16/TF32), where
-TorchSparse++'s implicit GEMM gains a hardware compute advantage, the
-crossover shifts to ${\sim}20$--$25\%$.
-In real detection networks such as CenterPoint~\cite{centerpoint}, the
-deepest sparse convolution stage (after $3\times$ stride-2 downsampling)
-operates at 35--57\% active ratio with $C_\text{in}{=}64$--$128$---precisely
-the regime where \skipgemm's writeback overhead is most acute.
-
-To close this gap, we propose \elasticgemm, an adaptive output-stationary
-kernel that eliminates the redundant computation of standard implicit GEMM
-without introducing atomic scatter.
-The key observation is that within an output-stationary thread block
-processing a $3{\times}3{\times}3$ kernel, the number of active neighbors
-varies dramatically per offset: some offsets (e.g., the center) are active
-for nearly all output points, while peripheral offsets may be active for
-only a fraction.
-In standard implicit GEMM, threads assigned to inactive output points at a
-given offset compute zero-valued MACs---wasted cycles that cannot be
-reclaimed.
-\elasticgemm \emph{redistributes} these idle threads: when only
-$1/k$ of the output points in a tile have active neighbors at a given
-offset, all threads cooperatively process different input channel segments
-of the active points, reducing the K-loop iteration count for that offset
-by a factor of $k$.
-After the shortened K-loop, a lightweight shared-memory reduce combines the
-partial channel sums---trading one reduce (a shared-memory write + read +
-barrier) for $k{-}1$ eliminated K-tile iterations (each involving global
-loads + full GEMM compute).
-This trade is overwhelmingly favorable: at $C_\text{in}{=}64$ and
-$\text{BK}{=}8$, a $4\times$ elastic reduction saves 6 K-tile iterations
-and costs one shared-memory round-trip.
-
-\paragraph{Unified runtime.}
-Together, \skipgemm and \elasticgemm form a unified runtime that covers the
-full sparsity spectrum:
-\skipgemm handles the high-sparsity layers where per-pair skip dominates
-(0.1--10\% active ratio), while \elasticgemm handles the moderate-sparsity
-layers where output-stationary execution with adaptive compute
-redistribution is more efficient (20--50\%+).
-The dispatch decision is made once per layer based on the active ratio,
-which is known after voxelization and preserved across submanifold
-convolution layers.
-
 \medskip
-\noindent The contributions of this paper are:
+\noindent This paper makes the following contributions:
 \begin{enumerate}
-\item \textbf{\skipgemm}, a weight-stationary execution model for sparse
-convolution that achieves computation proportional to active neighbor pairs
-within a single persistent-thread kernel. At 1\% active ratio, this is
-$11.5\times$ faster than the best existing system in FP32.
+\item A \textbf{worklist-driven execution model} for sparse convolution
+      that achieves computation proportional to active neighbor pairs
+      within a single persistent-thread kernel, unifying skip and
+      efficiency without the tradeoffs of implicit GEMM or
+      gather-GEMM-scatter.
 
-\item \textbf{\elasticgemm}, an adaptive output-stationary kernel that
-dynamically redistributes compute based on per-offset sparsity within each
-thread block, eliminating redundant computation without atomic scatter.
+\item \textbf{Lightweight locality recovery} through offset-major tile
+      assignment and autotuned weight-stationary micro-kernels, recovering
+      data reuse without heavy scheduling.
 
-\item A \textbf{unified runtime} that selects between \skipgemm and
-\elasticgemm per layer, targeting end-to-end speedup across the full
-sparsity spectrum of real 3D perception models.
+\item An end-to-end evaluation on 3D object detection and semantic
+      segmentation models showing \textbf{TODO}$\times$ speedup over
+      the fastest existing sparse convolution runtime, with numerically
+      identical outputs.
 \end{enumerate}
