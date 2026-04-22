@@ -8,75 +8,92 @@ LiDAR-based object detection~\cite{centerpoint,second}, semantic
 segmentation~\cite{semantickitti}, and scene reconstruction all build on
 stacks of sparse convolution layers to process inherently sparse voxelized
 representations of 3D sensor data.
-In production models such as CenterPoint~\cite{centerpoint} and SECOND~\cite{second}, sparse convolution
-accounts for \textbf{TODO}\% of end-to-end inference time, making its
-runtime efficiency a first-order concern.
+In production models such as CenterPoint~\cite{centerpoint} and
+SECOND~\cite{second}, sparse convolution accounts for
+\textbf{TODO}\% of end-to-end inference time, making its runtime
+efficiency a first-order concern.
 These models operate at extreme sparsity: across a typical detection
 network on KITTI, the average per-layer active ratio is below
-\textbf{TODO}\%, and even the densest layers
-rarely exceed \textbf{TODO}\%.
+\textbf{TODO}\%, and even the densest layers rarely exceed
+\textbf{TODO}\%.
 
-% P2 — What sparse convolution computes and why it is hard on GPUs
+% P2 — What sparse convolution computes and how it differs from sparse MM
+Unlike the sparse matrix multiplications common in large language models,
+where sparsity appears in the channel (feature) dimension and the
+computation pattern is structurally regular, 3D sparse convolution faces a
+fundamentally different challenge.
 A sparse convolution with kernel size $k$ (typically 3; we use symmetric
 $k^3$ kernels throughout) examines $k^3$ neighbor offsets around each
 active output voxel.
+The feature channels are always dense; what is sparse is the set of
+\emph{spatially active voxels} and, consequently, the set of active
+neighbors at each offset.
 At each offset, the runtime checks whether the corresponding input
 neighbor is also active; if so, the input features at that neighbor are
 multiplied against the offset's weight slice and accumulated into the
 output.
 The set of active neighbors varies per voxel and per offset, producing an
-irregular, data-dependent computation pattern.
-The central runtime challenge is how to reorganize this irregular work into
-the regular, coalesced execution that GPUs require for high utilization.
+irregular, data-dependent computation graph that changes with every input.
+The central runtime challenge is how to organize this spatially irregular
+work into efficient GPU execution.
 
-% P3 — Fundamental tradeoff: skip vs efficiency
-Existing systems resolve this challenge by committing to one side of a
-fundamental tradeoff between \emph{computation skipping} and
-\emph{execution efficiency}.
+% P3 — Existing approaches: what they get and what they lose
+Existing systems commit to one side of a fundamental tradeoff between
+\emph{computation skipping} and \emph{execution efficiency}.
 
-The \emph{implicit GEMM} approach (SpConv~v2~\cite{spconv2},
-TorchSparse++~\cite{torchsparse++}) treats every active output voxel as
-if all $k^3$ neighbors were present: it concatenates the full neighborhood
-into one large matrix and performs a single fused dense matrix multiply
-across all offsets simultaneously.
-This yields high GPU utilization and Tensor Core compatibility, but it
-cannot skip empty neighbors; missing neighbors simply contribute
-zero-valued rows that still consume compute cycles and memory bandwidth.
-Profiling a CenterPoint backbone on KITTI reveals that
-\textbf{TODO}\% of the fused multiply-accumulate operations
-involve such zero-valued inputs, wasted compute that
-scales with the kernel volume rather than the actual connectivity.
+The \emph{output-stationary} approach (implicit GEMM; SpConv~v2~\cite{spconv2},
+TorchSparse++~\cite{torchsparse++}) assigns each thread block a set of
+output voxels and iterates over all $k^3$ offsets, treating every neighbor
+as present.
+The full neighborhood is concatenated into one matrix and a single fused
+dense multiply is executed across all offsets simultaneously.
+This yields strong output locality (all partial sums for one output
+accumulate in-block, no atomic writes needed), good weight reuse (all
+outputs in a block share the same weight slice at each offset step), and
+high hardware utilization.
+But it cannot skip empty neighbors: missing neighbors contribute
+zero-valued rows that still consume compute and memory bandwidth.
+TorchSparse++ mitigates this via bitmask sorting (warp-level K-tile skip),
+but the skip granularity is limited by the output-stationary framework.
+Profiling a CenterPoint backbone on KITTI reveals that \textbf{TODO}\%
+of the fused multiply-accumulate operations involve zero-valued inputs.
+The GPU looks busy, but useful utilization is low.
 
-The \emph{per-offset gather-GEMM-scatter} approach
-(MinkowskiEngine~\cite{minkowski}) takes the opposite route: it loops
-over the $k^3$ offsets one by one, collects only the active pairs at each
-offset, and runs a separate matrix multiply for each.
-This avoids wasted computation on empty neighbors.
-However, it pays a steep price: up to $k^3$ separate kernel launches per
-convolution layer, severe load imbalance across offsets, and either a
-naive in-kernel matrix multiply or an extra copy into contiguous buffers
-before handing off to a tuned dense GEMM library.
-On the same CenterPoint backbone, gather-GEMM-scatter spends
-\textbf{TODO}\% of its wall time on launch overhead and data movement
-rather than useful arithmetic.
+The \emph{weight-stationary} approach (per-offset gather-GEMM-scatter;
+MinkowskiEngine~\cite{minkowski}) takes the opposite route: it processes
+offsets one by one, collecting only the active pairs at each offset and
+running a separate matrix multiply for each.
+This achieves exact work (computation proportional to active pairs) and
+good weight locality within each offset's multiply.
+However, different offsets have vastly different numbers of active pairs,
+producing severe load imbalance.
+This imbalance is fundamental (it comes from the spatial structure of the
+data); MinkowskiEngine's 27 separate kernel launches make it worse, but
+even a fused single-kernel per-offset approach still suffers from the
+uneven pair distribution.
+The same output voxel also receives partial sums from multiple offsets
+across separate multiplies, requiring scatter and accumulation.
 
-At the low densities that dominate real workloads, neither side works well.
-Implicit GEMM wastes overwhelmingly on empty neighbors.
-Gather-GEMM-scatter skips the empties, but each per-offset matrix multiply
-is too small to saturate the GPU.
+At the low densities that dominate real workloads, both approaches result
+in poor GPU utilization on useful work.
+Output-stationary keeps the SM busy but wastes most compute on empty
+neighbors.
+Weight-stationary does only useful compute but cannot spread it evenly
+across the GPU.
+The total amount of useful work (active neighbor pairs) is small; the
+first-order priority is to maximize the fraction of GPU capacity spent on
+that useful work.
 
-% P4 — Our insight: worklist-driven execution
-We observe that both sides of this tradeoff organize execution around
-\emph{offsets}: implicit GEMM iterates all offsets per output point,
-while gather-GEMM-scatter launches one kernel per offset.
-Neither organizes execution around the \emph{actual active work}.
-
-\sysname takes a different approach: \emph{worklist-driven execution}.
+% P4 — Our approach: disassemble for utilization
+\sysname starts from the weight-stationary side (per-offset exact work)
+and disassembles it for utilization.
 We precompute all active \texttt{(input, output)} neighbor pairs across
 every offset, group them by offset, and flatten the groups into a
-contiguous stream of dense GEMM tiles (a worklist).
-A single persistent-thread kernel then stride-loops over this worklist.
-This design has three key properties:
+contiguous stream of dense GEMM tiles: a worklist.
+Instead of each offset owning a separate multiply with its own resource
+allocation, all offsets' tiles are pooled into one flat stream and
+distributed evenly by a single kernel.
+This design has three properties:
 %
 \begin{itemize}
   \item \textbf{Exact work.}
@@ -84,60 +101,93 @@ This design has three key properties:
         entirely; computation is strictly proportional to active neighbor
         pairs.
   \item \textbf{Global load balance.}
-        All offsets share one kernel launch; the stride loop spreads tiles
-        evenly across thread blocks regardless of how unevenly pairs
-        distribute across offsets.
+        The flat tile stream is divided evenly across thread blocks.
+        No offset is too small to fill a block or too large and starves
+        others.
   \item \textbf{Dense inner compute.}
         Each tile is a standard dense matrix multiply, fully GPU-friendly
         and Tensor Core compatible.
 \end{itemize}
 
-% P5 — Challenge: exact work exposes memory issues
-Exact-work execution is not free.
-Once convolution is decomposed into per-offset active pairs, the runtime
-becomes more fetch-on-demand: input features are gathered indirectly via
-pair indices, output accumulation spans multiple offsets (requiring atomic
-additions), and tile ordering strongly affects cache reuse.
-The challenge is how to recover enough data locality \emph{without}
-sacrificing exact work or breaking global load balance.
+% P5 — What the worklist loses: locality
+The worklist maximizes utilization, but it disrupts both directions of
+locality that the original approaches had.
+Output-stationary's ``same output, all offsets in one block'' is gone:
+the same output voxel's partial sums are now spread across tiles from
+different offsets, requiring atomic additions.
+Weight-stationary's ``same offset, contiguous execution'' is partially
+preserved (tiles are grouped by offset within the worklist), but a naive
+stride-loop assignment can interleave tiles from different offsets across
+blocks, breaking weight reuse.
+More broadly, dense and implicit-GEMM convolution exploit the fact that
+spatially adjacent outputs share overlapping input neighborhoods; the
+worklist groups by offset instead, so cross-offset spatial relationships
+are lost.
 
-% P6 — Lightweight locality recovery
-\sysname addresses this with three low-complexity dataflow choices, rather
-than a heavy scheduling framework:
+The challenge is how to recover enough locality \emph{without} giving up
+exact work or breaking global load balance.
+
+% P6 — Persistent threads: the architectural bridge
+The worklist solves \emph{what} to compute; recovering locality requires
+control over \emph{how} tiles are scheduled onto hardware.
+Under ordinary grid dispatch, each thread block processes one tile and
+exits.
+The hardware scheduler decides which block runs on which SM next, so
+two logically adjacent tiles may land on different SMs, register state
+is lost between tiles, and L1/shared-memory contents are overwritten by
+intervening blocks.
+Any logical ordering of the worklist (e.g., offset-major) would have no
+guaranteed physical effect on data reuse.
+
+\sysname uses persistent threads: each thread block stays resident on its
+SM and processes tile after tile via a stride loop.
+This turns logical tile ordering into physical locality: the block's
+register file survives across tile boundaries, L1 cache and shared memory
+state carry over, and the tile processing order is exactly the worklist
+order.
+
+% P7 — Locality recovery: reassemble
+Building on persistent threads, \sysname recovers locality with two
+low-complexity dataflow choices rather than a heavy scheduling framework:
 %
 \begin{itemize}
   \item \textbf{Offset-major contiguous tile assignment.}
         Tiles in the worklist are ordered so that consecutive iterations of
-        the stride loop tend to share the same kernel offset.
-        This improves L2 cache locality for input features while preserving
-        the load-balance property of the global stride loop.
-  \item \textbf{Weight-fragment persistence.}
-        When consecutive tiles share the same offset, the weight slice can
-        be kept live in registers instead of being reloaded.
-        This turns the offset-major ordering into a direct reduction in
-        memory traffic.
-  \item We use \textbf{two-level sparsity-aware autotuning} to find the
-        optimal tile shape and micro-kernel variant with zero overhead on
-        the critical path as runtime sparsity level varies.
-        Offline sweeps build both a per-layer config table indexed by
-        sparsity bucket and an input-to-layer sparsity mapping; at
-        inference time, the runtime reads the input active ratio and
-        selects the best config for every layer on the host alone,  
-        without any per-layer profiling or device-to-host synchronization.
+        the stride loop share the same kernel offset.
+        This improves L2 cache locality for input features and enables the
+        weight reuse described next, while preserving the load-balance
+        property of the global stride loop.
+  \item \textbf{Cross-tile register reuse.}
+        When consecutive tiles share the same offset, the weight fragment
+        already in the persistent block's registers carries over directly.
+        L2 cache is insufficient for this: a single tile's K-loop touches
+        enough working data (indirect input gathers, partial outputs,
+        weight BK-slices) to evict previously cached weights.
+        Register persistence bypasses this eviction entirely.
+        Input-feature fragments can also be reused across output-channel
+        (BN) tiles within the same offset, which is especially valuable
+        because input loads are indirect gathers.
+        As a side effect, keeping data in registers reduces L2 cache
+        pressure, freeing capacity for the remaining irregular accesses
+        that benefit most from caching.
 \end{itemize}
 %
+The reassembled runtime not only recovers the locality that the worklist
+disrupted, but goes further: cross-tile input-feature reuse across
+output-channel tiles is something neither the original output-stationary
+nor weight-stationary approach provided.
 
-% % P7 — Operator-level preview; end-to-end evaluation is in progress
-% Table~\ref{tab:intro-perf} previews the operator-level impact of this
-% execution model on a controlled microbenchmark.
-% On an RTX~2080~Ti with FP32 precision, \sysname outperforms all existing
-% sparse convolution systems across the entire active-ratio range tested.
-% At 1\% active ratio (typical for LiDAR detection layers), \sysname is
-% $5.5\times$ faster than the fastest existing system.
-% The advantage holds up to 30\%, where \sysname still maintains a
-% $1.8\times$ margin.
-% End-to-end model-level evaluation on detection and segmentation benchmarks
-% is presented in \S\ref{sec:eval}.
+% P8 — Preview table
+Table~\ref{tab:intro-perf} previews the operator-level impact of this
+execution model.
+On an RTX~2080~Ti with FP32 precision, \sysname outperforms all existing
+sparse convolution systems across the entire active-ratio range tested.
+At 1\% active ratio (typical for LiDAR detection layers), \sysname is
+$5.5\times$ faster than the fastest existing system.
+The advantage holds up to 30\%, where \sysname still maintains a
+$1.8\times$ margin.
+End-to-end evaluation on detection and segmentation models is presented
+in \S\ref{sec:eval}.
 
 \begin{table}[t]
 \centering
@@ -170,13 +220,13 @@ ratio  &          & v2     &               & Engine     &  \\
 \begin{enumerate}
 \item A \textbf{worklist-driven execution model} for sparse convolution
       that achieves computation proportional to active neighbor pairs
-      within a single persistent-thread kernel, unifying skip and
-      efficiency without the tradeoffs of implicit GEMM or
-      gather-GEMM-scatter.
+      within a single persistent-thread kernel, unifying exact work and
+      global load balance.
 
-\item \textbf{Lightweight locality recovery} through offset-major tile
-      assignment and autotuned weight-stationary micro-kernels, recovering
-      data reuse without heavy scheduling.
+\item \textbf{Persistent-thread locality recovery} through offset-major
+      tile assignment and cross-tile register reuse of both weight and
+      input-feature fragments, recovering and exceeding the data reuse of
+      existing approaches without heavy scheduling.
 
 \item An end-to-end evaluation on 3D object detection and semantic
       segmentation models showing \textbf{TODO}$\times$ speedup over
